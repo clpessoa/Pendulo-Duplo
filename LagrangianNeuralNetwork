@@ -1,0 +1,487 @@
+
+@author: carolinapessoa
+"""
+
+#Step 1: Importações
+
+import jax
+
+from jax import config
+config.update("jax_enable_x64", True)
+
+import jax.numpy as jnp
+import numpy as np
+from jax.experimental.ode import odeint
+import matplotlib.pyplot as plt
+from functools import partial # reduces arguments to function by making some subset implicit
+
+from jax.example_libraries import stax
+from jax.example_libraries import optimizers
+
+import pandas as pd 
+from pynumdiff.optimize import suggest_method
+
+
+from matplotlib.patches import Circle
+#from moviepy.editor import ImageSequenceClip
+from moviepy import VideoFileClip, AudioFileClip, AudioArrayClip, vfx, concatenate_videoclips, ImageSequenceClip
+import proglog
+from PIL import Image
+
+
+from jax.lib import xla_bridge
+print(xla_bridge.get_backend().platform)
+
+#Step 2: Modelando o Pêndulo
+
+def lagrangian(q, q_dot, m1, m2, l1, l2, g):
+  t1, t2 = q     # theta 1 and theta 2
+  w1, w2 = q_dot # omega 1 and omega 2
+
+  # kinetic energy (T)
+  T1 = 0.5 * m1 * (l1 * w1)**2
+  T2 = 0.5 * m2 * ((l1 * w1)**2 + (l2 * w2)**2 +
+                    2 * l1 * l2 * w1 * w2 * jnp.cos(t1 - t2))
+  T = T1 + T2
+
+  # potential energy (V)
+  y1 = -l1 * jnp.cos(t1)
+  y2 = y1 - l2 * jnp.cos(t2)
+  V = m1 * g * y1 + m2 * g * y2
+
+  return T - V
+
+
+# **Step 3: Dinâmicas a partir do Lagrangiano
+
+
+def equation_of_motion(lagrangian, state, t=None):
+  q, q_t = jnp.split(state, 2)
+  q_tt = (jnp.linalg.pinv(jax.hessian(lagrangian, 1)(q, q_t))
+          @ (jax.grad(lagrangian, 0)(q, q_t)
+             - jax.jacobian(jax.jacobian(lagrangian, 1), 0)(q, q_t) @ q_t))
+  return jnp.concatenate([q_t, q_tt])
+
+def solve_lagrangian(lagrangian, initial_state, **kwargs):
+  # We currently run odeint on CPUs only, because its cost is dominated by
+  # control flow, which is slow on GPUs.
+  @partial(jax.jit, backend='cpu')
+  def f(initial_state):
+    return odeint(partial(equation_of_motion, lagrangian),
+                  initial_state, **kwargs)
+  return f(initial_state)
+
+#Funcões de apoio
+
+def normalize_dp(state):
+  # wrap generalized coordinates to [-pi, pi]
+  return jnp.concatenate([(state[:2] + np.pi) % (2 * np.pi) - np.pi, state[2:]])
+
+def rk4_step(f, x, t, h):
+  # one step of runge-kutta integration
+  k1 = h * f(x, t)
+  k2 = h * f(x + k1/2, t + h/2)
+  k3 = h * f(x + k2/2, t + h/2)
+  k4 = h * f(x + k3, t + h)
+  return x + 1/6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
+# **Step 4: Dados Experimentais
+
+if __name__ == "__main__":
+
+    csv_path = "/Users/carolinapessoa/Downloads/0.csv"
+    df = pd.read_csv(csv_path, sep=';')
+
+    expected_cols = ["x_red","y_red","x_green","y_green","x_blue","y_blue"]
+    missing = [c for c in expected_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV sem colunas esperadas: {missing}")
+    
+    red   = df[["x_red","y_red"]].to_numpy(dtype=np.float64)
+    green = df[["x_green","y_green"]].to_numpy(dtype=np.float64)
+    blue  = df[["x_blue","y_blue"]].to_numpy(dtype=np.float64)
+
+    # Informação do dataset - FPS ≈ 60 Hz (17.782 frames em 4 min 56 s)
+    dt = 1/60.0
+
+    # Vetores de cada haste e ângulos (0 rad = apontando para baixo) 
+    # haste 1: pivot (vermelho) -> massa1 (verde)
+    r2g = green - red
+    # haste 2: massa1 (verde) -> massa2 (azul)
+    g2b = blue - green
+    
+    # ângulo em relação ao eixo vertical para baixo:
+    # se (dx, dy) = (0, -L) => theta = 0
+    theta1 = np.arctan2(r2g[:, 0], -r2g[:, 1])  # atan2(dx, -dy)
+    theta2 = np.arctan2(g2b[:, 0], -g2b[:, 1])
+    
+    # remover quebras de 2π
+    theta1 = np.unwrap(theta1)
+    theta2 = np.unwrap(theta2)
+    
+
+    # Derivadas utilizando PyNumDiff
+
+    # θ1 → (θ1_hat, ω1_hat)
+    method_t1, params_t1 = suggest_method(theta1, dt, cutoff_frequency=3)
+    print(f"[θ1] Best method: {getattr(method_t1, '__name__', str(method_t1))} | params: {params_t1}")
+    theta1_hat, omega1_hat = method_t1(theta1, dt, **params_t1)
+
+    # θ2 → (θ2_hat, ω2_hat)
+    method_t2, params_t2 = suggest_method(theta2, dt, cutoff_frequency=3)
+    print(f"[θ2] Best method: {getattr(method_t2, '__name__', str(method_t2))} | params: {params_t2}")
+    theta2_hat, omega2_hat = method_t2(theta2, dt, **params_t2)
+    
+    #%% Persistir parâmetros de θ
+    import json, numpy as np
+    def np_to_py(o):
+        if isinstance(o, np.generic):
+            return o.item()
+        if isinstance(o, (np.bool_, bool)):
+            return bool(o)
+        return o
+
+    with open("params_theta.json", "w") as f:
+        json.dump({
+            "t1": {"method": getattr(method_t1, "__name__", str(method_t1)), "params": params_t1},
+            "t2": {"method": getattr(method_t2, "__name__", str(method_t2)), "params": params_t2},
+        }, f, default=np_to_py, indent=2)
+    print("Parâmetros salvos em params_theta.json")
+
+
+    #%% Derivar α a partir de ω 
+    print(f"[ω1→α1] Reusando de θ1: {getattr(method_t1, '__name__', str(method_t1))} | {params_t1}")
+    omega1_filt, alpha1_hat = method_t1(omega1_hat, dt, **params_t1)
+
+    print(f"[ω2→α2] Reusando de θ2: {getattr(method_t2, '__name__', str(method_t2))} | {params_t2}")
+    omega2_filt, alpha2_hat = method_t2(omega2_hat, dt, **params_t2)
+
+    # Estados - suavizadas pelo PyNumDiff
+    theta1_use = theta1_hat
+    theta2_use = theta2_hat
+    omega1_use = omega1_hat
+    omega2_use = omega2_hat
+    alpha1_use = alpha1_hat
+    alpha2_use = alpha2_hat
+
+    # empilhando os estados e derivadas
+    x_all  = np.stack([theta1_use, theta2_use, omega1_use, omega2_use], axis=1).astype(np.float64)
+    xt_all = np.stack([omega1_use,  omega2_use,  alpha1_use,  alpha2_use ], axis=1).astype(np.float64)
+    
+
+# Visualizações de sanidade
+
+N_frames = len(red)
+t_axis = np.arange(N_frames) * dt
+
+# 1) Estabilidade do pivô e comprimentos aparentes (em pixels)
+pivot_rel = red - red[0]                 # deslocamento do pivô vs. frame 0
+L1_pix = np.linalg.norm(r2g, axis=1)     # |pivô -> massa1|
+L2_pix = np.linalg.norm(g2b, axis=1)     # |massa1 -> massa2|
+
+print(f"L1 (px): mean={L1_pix.mean():.2f}, std={L1_pix.std():.2f} "
+      f"({100*L1_pix.std()/L1_pix.mean():.2f}%)")
+print(f"L2 (px): mean={L2_pix.mean():.2f}, std={L2_pix.std():.2f} "
+      f"({100*L2_pix.std()/L2_pix.mean():.2f}%)")
+
+plt.figure(figsize=(12,3))
+plt.subplot(1,3,1); plt.title("Pivot (x,y) relativo")
+plt.plot(t_axis, pivot_rel[:,0], label='x')
+plt.plot(t_axis, pivot_rel[:,1], label='y')
+plt.xlabel("tempo (s)"); plt.legend()
+
+plt.subplot(1,3,2); plt.title("Comprimento L1 (px)")
+plt.plot(t_axis, L1_pix); plt.xlabel("tempo (s)")
+
+plt.subplot(1,3,3); plt.title("Comprimento L2 (px)")
+plt.plot(t_axis, L2_pix); plt.xlabel("tempo (s)")
+plt.tight_layout(); plt.show()
+
+# 2) Trajetórias 2D (checagem rápida) + pivô fixo 
+plt.figure(figsize=(5,5))
+plt.plot(green[:,0], green[:,1], '.', ms=1, color='#2e7d32', label='massa 1 (verde)')   # verde
+plt.plot(blue[:,0],  blue[:,1],  '.', ms=1, color='#1565c0', label='massa 2 (azul)')    # azul
+# pivô fixo no centro:
+plt.scatter(red[0,0], red[0,1], s=80, c='red', edgecolors='k', zorder=3, label='pivô (fixo)')
+plt.gca().invert_yaxis()                 # manter se o eixo y do CSV cresce p/ baixo
+plt.axis('equal'); plt.legend(); plt.title("Trajetórias 2D"); plt.show()
+
+# 3) Ângulos brutos vs. filtrados (TODO o período)
+plt.figure(figsize=(12,5))
+plt.title("θ bruto vs filtrado (todo o período)")
+# θ1: bruto = verde escuro; filtrado = verde claro
+plt.plot(t_axis, theta1,     ls='--', lw=2.0, alpha=0.8, color='#1b5e20', label='θ1 bruto')   # verde escuro
+plt.plot(t_axis, theta1_hat, lw=0.9,               color='#66bb6a', label='θ1 filtrado')      # verde claro
+# θ2: bruto = azul escuro; filtrado = azul claro
+plt.plot(t_axis, theta2,     ls='--', lw=2.0, alpha=0.8, color='#0d47a1', label='θ2 bruto')   # azul escuro
+plt.plot(t_axis, theta2_hat, lw=0.9,               color='#64b5f6', label='θ2 filtrado')      # azul claro
+plt.xlabel("tempo (s)")
+plt.ylabel("rad")
+plt.legend()
+plt.tight_layout(); plt.show()
+
+# 3b) Velocidades filtradas (TODO o período)
+plt.figure(figsize=(12,4))
+plt.title("ω (velocidades angulares estimadas)")
+plt.plot(t_axis, omega1_hat, lw=1.5, color='#2e7d32', label='ω1')  # verde
+plt.plot(t_axis, omega2_hat, lw=1.5, color='#1565c0', label='ω2')  # azul
+plt.xlabel("tempo (s)")
+plt.ylabel("rad/s")
+plt.legend()
+plt.tight_layout(); plt.show()
+
+# 4) Acelerações estimadas (TODO o período)
+plt.figure(figsize=(12,3))
+plt.title("α (Acelerações estimadas)")
+plt.plot(t_axis, alpha1_hat, lw=1.2, color='#2e7d32', label='α1')  # verde
+plt.plot(t_axis, alpha2_hat, lw=1.2, color='#1565c0', label='α2')  # azul
+plt.xlabel("tempo (s)"); plt.ylabel("rad/s²"); plt.legend()
+plt.tight_layout(); plt.show()
+
+#%% Step 5: TREINO
+
+time_step = dt       # 1/60 s
+N = 300
+
+T = x_all.shape[0]
+
+# Conjuntos de treino 
+x_train  = x_all[0:N]         # (N, 4)  -> [θ1, θ2, ω1, ω2]
+xt_train = xt_all[0:N]        # (N, 4)  -> [ω1, ω2, α1, α2]
+y_train  = x_all[1:N+1]       # (N, 4)  -> next step 
+
+x_test   = x_all[N:2*N]       # (N, 4)
+xt_test  = xt_all[N:2*N]      # (N, 4)
+y_test   = x_all[N+1:2*N+1]   # (N, 4)
+
+
+# Visualização do treino e teste
+# Dados normalizados de [-pi, pi]
+
+train_vis = jax.vmap(normalize_dp)(x_train)
+test_vis  = jax.vmap(normalize_dp)(x_test)
+
+
+vel_angle = lambda data:  (np.arctan2(data[:,3], data[:,2]) / np.pi + 1)/2
+vel_color = lambda vangle: np.stack([np.zeros_like(vangle), vangle, 1-vangle]).T
+train_colors = vel_color(vel_angle(train_vis))
+test_colors  = vel_color(vel_angle(test_vis))
+
+# plot
+SCALE = 30 ; WIDTH = 0.002
+plt.figure(figsize=[8,4], dpi=120)
+plt.subplot(1,2,1)
+plt.title("Dados de Treino") ; plt.xlabel(r'$\theta_1$') ; plt.ylabel(r'$\theta_2$')
+plt.quiver(*train_vis.T, color=train_colors, scale=SCALE, width=WIDTH)
+
+plt.subplot(1,2,2)
+plt.title("Dados de Teste") ; plt.xlabel(r'$\theta_1$') ; plt.ylabel(r'$\theta_2$')
+plt.quiver(*test_vis.T, color=test_colors, scale=SCALE, width=WIDTH)
+
+plt.tight_layout() ; plt.show()
+
+#%% Step 6: Construindo a Rede Neural Lagrangiana
+
+# i) Modelo e função de perda
+
+# Substituindo o lagrangiano por um modelo paramétrico
+def learned_lagrangian(params):
+  def lagrangian(q, q_t):
+    assert q.shape == (2,)
+    state = normalize_dp(jnp.concatenate([q, q_t]))
+    return jnp.squeeze(nn_forward_fn(params, state), axis=-1)
+  return lagrangian
+
+# Definindo a função de perda do modelo (MSE entre predições e alvos)
+@jax.jit
+def loss(params, batch, time_step=None):
+  state, targets = batch
+  if time_step is not None:
+    f = partial(equation_of_motion, learned_lagrangian(params))
+    preds = jax.vmap(partial(rk4_step, f, t=0.0, h=time_step))(state)
+  else:
+    preds = jax.vmap(partial(equation_of_motion, learned_lagrangian(params)))(state)
+  return jnp.mean((preds - targets) ** 2)
+
+# Construindo a rede neural multicamadas
+init_random_params, nn_forward_fn = stax.serial(
+    stax.Dense(128),
+    stax.Softplus,
+    stax.Dense(128),
+    stax.Softplus,
+    stax.Dense(1),
+)
+
+# ii) Otimização e preparação dos dados
+
+@jax.jit
+def update_timestep(i, opt_state, batch):
+  params = get_params(opt_state)
+  return opt_update(i, jax.grad(loss)(params, batch, time_step), opt_state)
+
+@jax.jit
+def update_derivative(i, opt_state, batch):
+  params = get_params(opt_state)
+  return opt_update(i, jax.grad(loss)(params, batch, None), opt_state)
+
+x_train = jax.device_put(jax.vmap(normalize_dp)(x_train))
+y_train = jax.device_put(y_train)
+
+x_test = jax.device_put(jax.vmap(normalize_dp)(x_test))
+y_test = jax.device_put(y_test)
+
+# iii) Treinando o modelo
+ 
+rng = jax.random.PRNGKey(0)
+_, init_params = init_random_params(rng, (-1, 4))
+
+# numbers in comments denote stephan's settings
+batch_size = 100
+test_every = 10
+num_batches = 1500
+
+train_losses = []
+test_losses = []
+
+# Otimizador Adam (Adaptive Moment Estimation) e taxa de decaimento
+opt_init, opt_update, get_params = optimizers.adam(
+     lambda t: jnp.select([t < batch_size*(num_batches//3),
+                           t < batch_size*(2*num_batches//3),
+                           t > batch_size*(2*num_batches//3)],
+                          [1e-3, 3e-4, 1e-4]))
+opt_state = opt_init(init_params)
+ 
+for iteration in range(batch_size*num_batches + 1):
+   if iteration % batch_size == 0:
+     params = get_params(opt_state)
+     train_loss = loss(params, (x_train, xt_train))
+     train_losses.append(train_loss)
+     test_loss = loss(params, (x_test, xt_test))
+     test_losses.append(test_loss)
+     if iteration % (batch_size*test_every) == 0:
+       print(f"iteration={iteration}, train_loss={train_loss:.6f}, test_loss={test_loss:.6f}")
+   opt_state = update_derivative(iteration, opt_state, (x_train, xt_train))
+ 
+params = get_params(opt_state)
+
+#%% # iv) Visualização da Função de Perda (treino vs teste)
+
+plt.figure(figsize=(8, 3.5), dpi=120)
+plt.plot(train_losses, label='Perda - Treino')
+plt.plot(test_losses, label='Perda - Teste')
+plt.yscale('log')
+plt.ylim(None, 300)
+plt.title('Perdas durante o treinamento')
+plt.xlabel("Fase de treino") ; plt.ylabel("Mean squared error (MSE)")
+plt.legend() ; plt.show()
+
+#%% **Step 7: Visualizando o que o modelo aprendeu
+# i) Plot predicted vs actual coordinates 
+
+xt_pred = jax.vmap(partial(equation_of_motion, learned_lagrangian(params)))(x_test)
+
+fig, axes = plt.subplots(1, 2, figsize=(6, 3), dpi=120)
+axes[0].scatter(xt_test[:, 2], xt_pred[:, 2], s=6, alpha=0.2)
+axes[0].set_title('Predicting $\dot q$')
+axes[0].set_xlabel('$\dot q$ actual')
+axes[0].set_ylabel('$\dot q$ predicted')
+axes[1].scatter(xt_test[:, 3], xt_pred[:, 3], s=6, alpha=0.2)
+axes[1].set_title('Predicting $\ddot q$')
+axes[1].set_xlabel('$\ddot q$ actual')
+axes[1].set_ylabel('$\ddot q$ predicted')
+plt.tight_layout()
+
+#%% === Step 7: Avaliando no conjunto de teste (derivative mode) ===
+
+def diag_plot(ax, y_true, y_pred, label):
+    # dispersão
+    ax.scatter(y_true, y_pred, s=6, alpha=0.25)
+    # faixa simétrica e linha identidade
+    both = np.concatenate([y_true, y_pred])
+    lo, hi = np.percentile(both, 0.5), np.percentile(both, 99.5)
+    m = max(abs(lo), abs(hi)); lo, hi = -m, m
+    ax.plot([lo, hi], [lo, hi], ls='--', lw=1)
+    ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
+    # métricas rápidas
+    rmse = np.sqrt(np.mean((y_true - y_pred)**2))
+    r = np.corrcoef(y_true, y_pred)[0, 1]
+    ax.set_title(f'{label}  |  RMSE={rmse:.3f},  R²={r**2:.3f}')
+    ax.set_xlabel('actual'); ax.set_ylabel('predicted')
+
+fig, axes = plt.subplots(2, 2, figsize=(9, 7), dpi=150)
+diag_plot(axes[0,0], xt_test[:,0], xt_pred[:,0], r'$\omega_1$')   # q̇1
+diag_plot(axes[0,1], xt_test[:,1], xt_pred[:,1], r'$\omega_2$')   # q̇2
+diag_plot(axes[1,0], xt_test[:,2], xt_pred[:,2], r'$\alpha_1$')   # q̈1
+diag_plot(axes[1,1], xt_test[:,3], xt_pred[:,3], r'$\alpha_2$')   # q̈2
+plt.tight_layout(); plt.show()
+
+plt.savefig("pred_vs_actual.png", dpi=200, bbox_inches='tight')
+
+#%% Step 8 — Trajetórias 2D até ~75 s 
+
+# utilidade: ângulos -> cartesiano
+def radial2cartesian(t1, t2, l1, l2):
+    x1 = l1 * np.sin(t1)
+    y1 = -l1 * np.cos(t1)
+    x2 = x1 + l2 * np.sin(t2)
+    y2 = y1 - l2 * np.cos(t2)
+    return x1, y1, x2, y2
+
+# comprimentos corretos (m)
+L1, L2 = 0.91, 0.70
+
+# ~75 s em frames (limitado ao tamanho do dataset)
+f_end = min(int(round(75.0 / dt)), x_all.shape[0])
+assert f_end > 1, "Janela muito curta: verifique dt e o tamanho do dataset."
+
+# === 1) EXPERIMENTAL (0..~75 s) ===
+theta1_exp = theta1_use[:f_end]
+theta2_exp = theta2_use[:f_end]
+x1e, y1e, x2e, y2e = radial2cartesian(theta1_exp, theta2_exp, L1, L2)
+
+# === 2) LNN (rollout 0..~75 s, mesmo nº de amostras) ===
+x0   = jnp.array(x_all[0], dtype=jnp.float64)             # estado inicial medido
+tvec = dt * np.arange(0, f_end, dtype=np.float64)         # 0..~75 s
+f_lnn = learned_lagrangian(params)
+x_lnn = jax.device_get(solve_lagrangian(f_lnn, x0, t=tvec))
+
+theta1_lnn = x_lnn[:, 0]
+theta2_lnn = x_lnn[:, 1]
+x1m, y1m, x2m, y2m = radial2cartesian(theta1_lnn, theta2_lnn, L1, L2)
+
+# mesma moldura p/ ambos
+R = (L1 + L2) * 1.05
+lims = (-R, R)
+
+# (opcional) reduzir pontos só na visualização
+viz_stride = 1  # aumente p/ 2,3,… se quiser desenhar menos pontos
+
+# cores (verde e azul “normal”)
+green = '#2e7d32'
+blue  = '#1565c0'
+
+# === FIG 1: EXPERIMENTAL ===
+plt.figure(figsize=(6,6), dpi=140)
+plt.plot(x1e[::viz_stride], y1e[::viz_stride], '--', lw=1.6, alpha=0.95,
+         color=green, label='M1 exp')
+plt.plot(x2e[::viz_stride], y2e[::viz_stride], '--', lw=1.6, alpha=0.95,
+         color=blue,  label='M2 exp')
+plt.scatter(0, 0, s=50, c='red', edgecolors='k', zorder=3, label='pivô')
+plt.axis('equal'); plt.xlim(lims); plt.ylim(lims)
+plt.title("Trajetórias 2D — Dados experimentais (0–~75 s)")
+plt.xlabel("x [m]"); plt.ylabel("y [m]")
+plt.legend(loc='upper right', frameon=True)
+plt.tight_layout()
+
+# === FIG 2: LNN ===
+plt.figure(figsize=(6,6), dpi=140)
+plt.plot(x1m[::viz_stride], y1m[::viz_stride], '--', lw=1.6, alpha=0.95,
+         color=green, label='M1 LNN')
+plt.plot(x2m[::viz_stride], y2m[::viz_stride], '--', lw=1.6, alpha=0.95,
+         color=blue,  label='M2 LNN')
+plt.scatter(0, 0, s=50, c='red', edgecolors='k', zorder=3, label='pivô')
+plt.axis('equal'); plt.xlim(lims); plt.ylim(lims)
+plt.title("Trajetórias 2D — LNN (0–~75 s)")
+plt.xlabel("x [m]"); plt.ylabel("y [m]")
+plt.legend(loc='upper right', frameon=True)
+plt.tight_layout()
