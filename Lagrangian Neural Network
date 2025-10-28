@@ -338,7 +338,7 @@ _, init_params = init_random_params(rng, (-1, 4))
 # numbers in comments denote stephan's settings
 batch_size = 100
 test_every = 10
-num_batches = 1500
+num_batches = 300
 
 train_losses = []
 test_losses = []
