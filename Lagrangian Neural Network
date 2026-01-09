@@ -1,8 +1,7 @@
+Created on Wed Dec 17 15:53:44 2025
 
 @author: carolinapessoa
 """
-
-#Step 1: Importações
 
 import jax
 
@@ -21,30 +20,29 @@ from jax.example_libraries import optimizers
 import pandas as pd 
 from pynumdiff.optimize import suggest_method
 
-
+# Visualização
 from matplotlib.patches import Circle
 #from moviepy.editor import ImageSequenceClip
 from moviepy import VideoFileClip, AudioFileClip, AudioArrayClip, vfx, concatenate_videoclips, ImageSequenceClip
 import proglog
 from PIL import Image
 
-
 from jax.lib import xla_bridge
 print(xla_bridge.get_backend().platform)
 
-#Step 2: Modelando o Pêndulo
+# Passo 1: Modelando o pêndulo duplo
 
 def lagrangian(q, q_dot, m1, m2, l1, l2, g):
   t1, t2 = q     # theta 1 and theta 2
   w1, w2 = q_dot # omega 1 and omega 2
 
-  # kinetic energy (T)
+  # energia cinética (T)
   T1 = 0.5 * m1 * (l1 * w1)**2
   T2 = 0.5 * m2 * ((l1 * w1)**2 + (l2 * w2)**2 +
                     2 * l1 * l2 * w1 * w2 * jnp.cos(t1 - t2))
   T = T1 + T2
 
-  # potential energy (V)
+  # energia potêncial (V)
   y1 = -l1 * jnp.cos(t1)
   y2 = y1 - l2 * jnp.cos(t2)
   V = m1 * g * y1 + m2 * g * y2
@@ -52,7 +50,7 @@ def lagrangian(q, q_dot, m1, m2, l1, l2, g):
   return T - V
 
 
-# **Step 3: Dinâmicas a partir do Lagrangiano
+# Passo 2: Obtendo as dinâmicas do Lagrangiano
 
 
 def equation_of_motion(lagrangian, state, t=None):
@@ -63,15 +61,14 @@ def equation_of_motion(lagrangian, state, t=None):
   return jnp.concatenate([q_t, q_tt])
 
 def solve_lagrangian(lagrangian, initial_state, **kwargs):
-  # We currently run odeint on CPUs only, because its cost is dominated by
-  # control flow, which is slow on GPUs.
+
   @partial(jax.jit, backend='cpu')
   def f(initial_state):
     return odeint(partial(equation_of_motion, lagrangian),
                   initial_state, **kwargs)
   return f(initial_state)
 
-#Funcões de apoio
+# Funcões de apoio
 
 def normalize_dp(state):
   # wrap generalized coordinates to [-pi, pi]
@@ -85,7 +82,7 @@ def rk4_step(f, x, t, h):
   k4 = h * f(x + k3, t + h)
   return x + 1/6 * (k1 + 2 * k2 + 2 * k3 + k4)
 
-# **Step 4: Dados Experimentais
+# Passo 3: Conjunto de dados + derivadas utilizando PyNumDiff 
 
 if __name__ == "__main__":
 
@@ -97,14 +94,15 @@ if __name__ == "__main__":
     if missing:
         raise ValueError(f"CSV sem colunas esperadas: {missing}")
     
+    # Convertendo para float64
     red   = df[["x_red","y_red"]].to_numpy(dtype=np.float64)
     green = df[["x_green","y_green"]].to_numpy(dtype=np.float64)
     blue  = df[["x_blue","y_blue"]].to_numpy(dtype=np.float64)
 
-    # Informação do dataset - FPS ≈ 60 Hz (17.782 frames em 4 min 56 s)
+    # Conjunto de dados - FPS ≈ 60 Hz (17.782 frames | 4 min 56 s)
     dt = 1/60.0
 
-    # Vetores de cada haste e ângulos (0 rad = apontando para baixo) 
+    # ---- 4.3 Vetores de cada haste e ângulos (0 rad = apontando para baixo) ----
     # haste 1: pivot (vermelho) -> massa1 (verde)
     r2g = green - red
     # haste 2: massa1 (verde) -> massa2 (azul)
@@ -119,44 +117,35 @@ if __name__ == "__main__":
     theta1 = np.unwrap(theta1)
     theta2 = np.unwrap(theta2)
     
+    # usar parâmetros salvos (evita a necessidade de rodar o suggest_method sempre) 
+    import json, importlib, pkgutil
+    import pynumdiff
 
-    # Derivadas utilizando PyNumDiff
+    def _resolve_pynd_method(name: str):
+        # procura o callable pelo nome em todos os submódulos do pynumdiff
+        for _, modname, _ in pkgutil.walk_packages(pynumdiff.__path__, pynumdiff.__name__ + "."):
+            mod = importlib.import_module(modname)
+            if hasattr(mod, name):
+                return getattr(mod, name)
+        raise ValueError(f"Método '{name}' não encontrado nos submódulos do pynumdiff.")
+    
+    with open("params_theta.json", "r") as f:
+        meta = json.load(f)
 
-    # θ1 → (θ1_hat, ω1_hat)
-    method_t1, params_t1 = suggest_method(theta1, dt, cutoff_frequency=3)
-    print(f"[θ1] Best method: {getattr(method_t1, '__name__', str(method_t1))} | params: {params_t1}")
+    method_t1 = _resolve_pynd_method(meta["t1"]["method"])
+    params_t1 = meta["t1"]["params"]
     theta1_hat, omega1_hat = method_t1(theta1, dt, **params_t1)
-
-    # θ2 → (θ2_hat, ω2_hat)
-    method_t2, params_t2 = suggest_method(theta2, dt, cutoff_frequency=3)
-    print(f"[θ2] Best method: {getattr(method_t2, '__name__', str(method_t2))} | params: {params_t2}")
+    
+    method_t2 = _resolve_pynd_method(meta["t2"]["method"])
+    params_t2 = meta["t2"]["params"]
     theta2_hat, omega2_hat = method_t2(theta2, dt, **params_t2)
     
-    #%% Persistir parâmetros de θ
-    import json, numpy as np
-    def np_to_py(o):
-        if isinstance(o, np.generic):
-            return o.item()
-        if isinstance(o, (np.bool_, bool)):
-            return bool(o)
-        return o
-
-    with open("params_theta.json", "w") as f:
-        json.dump({
-            "t1": {"method": getattr(method_t1, "__name__", str(method_t1)), "params": params_t1},
-            "t2": {"method": getattr(method_t2, "__name__", str(method_t2)), "params": params_t2},
-        }, f, default=np_to_py, indent=2)
-    print("Parâmetros salvos em params_theta.json")
-
-
-    #%% Derivar α a partir de ω 
-    print(f"[ω1→α1] Reusando de θ1: {getattr(method_t1, '__name__', str(method_t1))} | {params_t1}")
+    # acelerações reaproveitando o mesmo método e params (como antes)
     omega1_filt, alpha1_hat = method_t1(omega1_hat, dt, **params_t1)
-
-    print(f"[ω2→α2] Reusando de θ2: {getattr(method_t2, '__name__', str(method_t2))} | {params_t2}")
     omega2_filt, alpha2_hat = method_t2(omega2_hat, dt, **params_t2)
 
-    # Estados - suavizadas pelo PyNumDiff
+
+    # Estados ( séries suavizadas pelo PyNumDiff)
     theta1_use = theta1_hat
     theta2_use = theta2_hat
     omega1_use = omega1_hat
@@ -164,7 +153,7 @@ if __name__ == "__main__":
     alpha1_use = alpha1_hat
     alpha2_use = alpha2_hat
 
-    # empilhando os estados e derivadas
+    # empilhar estados e "derivadas estimadas"
     x_all  = np.stack([theta1_use, theta2_use, omega1_use, omega2_use], axis=1).astype(np.float64)
     xt_all = np.stack([omega1_use,  omega2_use,  alpha1_use,  alpha2_use ], axis=1).astype(np.float64)
     
@@ -197,7 +186,7 @@ plt.subplot(1,3,3); plt.title("Comprimento L2 (px)")
 plt.plot(t_axis, L2_pix); plt.xlabel("tempo (s)")
 plt.tight_layout(); plt.show()
 
-# 2) Trajetórias 2D (checagem rápida) + pivô fixo 
+# 2) Trajetórias 2D (checagem rápida) + pivô fixo (bolinha vermelha)
 plt.figure(figsize=(5,5))
 plt.plot(green[:,0], green[:,1], '.', ms=1, color='#2e7d32', label='massa 1 (verde)')   # verde
 plt.plot(blue[:,0],  blue[:,1],  '.', ms=1, color='#1565c0', label='massa 2 (azul)')    # azul
@@ -238,10 +227,10 @@ plt.plot(t_axis, alpha2_hat, lw=1.2, color='#1565c0', label='α2')  # azul
 plt.xlabel("tempo (s)"); plt.ylabel("rad/s²"); plt.legend()
 plt.tight_layout(); plt.show()
 
-#%% Step 5: TREINO
+#%% Passo 4: Gerando dados de treino e teste
 
 time_step = dt       # 1/60 s
-N = 300
+N = 1500 # de 0 a 1500 frames
 
 T = x_all.shape[0]
 
@@ -280,7 +269,7 @@ plt.quiver(*test_vis.T, color=test_colors, scale=SCALE, width=WIDTH)
 
 plt.tight_layout() ; plt.show()
 
-#%% Step 6: Construindo a Rede Neural Lagrangiana
+#%% Passo 5: Implementando a Rede Neural Lagrangiana
 
 # i) Modelo e função de perda
 
@@ -303,7 +292,7 @@ def loss(params, batch, time_step=None):
     preds = jax.vmap(partial(equation_of_motion, learned_lagrangian(params)))(state)
   return jnp.mean((preds - targets) ** 2)
 
-# Construindo a rede neural multicamadas
+# Construindo as camadas da rede neural
 init_random_params, nn_forward_fn = stax.serial(
     stax.Dense(128),
     stax.Softplus,
@@ -335,10 +324,9 @@ y_test = jax.device_put(y_test)
 rng = jax.random.PRNGKey(0)
 _, init_params = init_random_params(rng, (-1, 4))
 
-# numbers in comments denote stephan's settings
 batch_size = 100
 test_every = 10
-num_batches = 300
+num_batches = 500  #Total de 50.000 atualizações de treino e teste
 
 train_losses = []
 test_losses = []
@@ -364,7 +352,7 @@ for iteration in range(batch_size*num_batches + 1):
  
 params = get_params(opt_state)
 
-#%% # iv) Visualização da Função de Perda (treino vs teste)
+#%% # Plot: perdas ao longo do treinamento
 
 plt.figure(figsize=(8, 3.5), dpi=120)
 plt.plot(train_losses, label='Perda - Treino')
@@ -375,8 +363,8 @@ plt.title('Perdas durante o treinamento')
 plt.xlabel("Fase de treino") ; plt.ylabel("Mean squared error (MSE)")
 plt.legend() ; plt.show()
 
-#%% **Step 7: Visualizando o que o modelo aprendeu
-# i) Plot predicted vs actual coordinates 
+#%% Passo 6: Visualizando o que o modelo aprendeu
+# i) Plot: coordenadas reais do sistema modelo versus predições
 
 xt_pred = jax.vmap(partial(equation_of_motion, learned_lagrangian(params)))(x_test)
 
@@ -391,20 +379,20 @@ axes[1].set_xlabel('$\ddot q$ actual')
 axes[1].set_ylabel('$\ddot q$ predicted')
 plt.tight_layout()
 
-#%% === Step 7: Avaliando no conjunto de teste (derivative mode) ===
+#%% Passo 7: avaliar no conjunto de teste (derivative mode) ===
 
-def diag_plot(ax, y_true, y_pred, label):
+def diag_plot(ax, xt_test, xt_pred, label):
     # dispersão
-    ax.scatter(y_true, y_pred, s=6, alpha=0.25)
+    ax.scatter(xt_test, xt_pred, s=6, alpha=0.25)
     # faixa simétrica e linha identidade
-    both = np.concatenate([y_true, y_pred])
+    both = np.concatenate([xt_test, xt_pred])
     lo, hi = np.percentile(both, 0.5), np.percentile(both, 99.5)
     m = max(abs(lo), abs(hi)); lo, hi = -m, m
     ax.plot([lo, hi], [lo, hi], ls='--', lw=1)
     ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
     # métricas rápidas
-    rmse = np.sqrt(np.mean((y_true - y_pred)**2))
-    r = np.corrcoef(y_true, y_pred)[0, 1]
+    rmse = np.sqrt(np.mean((xt_test - xt_pred)**2))
+    r = np.corrcoef(xt_test, xt_pred)[0, 1]
     ax.set_title(f'{label}  |  RMSE={rmse:.3f},  R²={r**2:.3f}')
     ax.set_xlabel('actual'); ax.set_ylabel('predicted')
 
@@ -417,9 +405,10 @@ plt.tight_layout(); plt.show()
 
 plt.savefig("pred_vs_actual.png", dpi=200, bbox_inches='tight')
 
-#%% Step 8 — Trajetórias 2D até ~75 s 
+#%% Passo 8 — Trajetórias 2D (em pontos) — Real vs LNN
+# Figura 1: Treino (0 → N)      (a) Real   (b) LNN
+# Figura 2: Teste  (N → 2N)     (a) Real   (b) LNN
 
-# utilidade: ângulos -> cartesiano
 def radial2cartesian(t1, t2, l1, l2):
     x1 = l1 * np.sin(t1)
     y1 = -l1 * np.cos(t1)
@@ -427,61 +416,88 @@ def radial2cartesian(t1, t2, l1, l2):
     y2 = y1 - l2 * np.cos(t2)
     return x1, y1, x2, y2
 
-# comprimentos corretos (m)
+# comprimentos (m)
 L1, L2 = 0.91, 0.70
 
-# ~75 s em frames (limitado ao tamanho do dataset)
-f_end = min(int(round(75.0 / dt)), x_all.shape[0])
-assert f_end > 1, "Janela muito curta: verifique dt e o tamanho do dataset."
+# Garantias básicas
+assert N > 10, "N muito pequeno."
+assert x_all.shape[0] >= 2*N + 1, f"Dataset precisa ter pelo menos 2N+1 amostras. T={x_all.shape[0]}, 2N+1={2*N+1}"
 
-# === 1) EXPERIMENTAL (0..~75 s) ===
-theta1_exp = theta1_use[:f_end]
-theta2_exp = theta2_use[:f_end]
-x1e, y1e, x2e, y2e = radial2cartesian(theta1_exp, theta2_exp, L1, L2)
 
-# === 2) LNN (rollout 0..~75 s, mesmo nº de amostras) ===
-x0   = jnp.array(x_all[0], dtype=jnp.float64)             # estado inicial medido
-tvec = dt * np.arange(0, f_end, dtype=np.float64)         # 0..~75 s
+def solve_lagrangian(f_lnn, initial_state, t):
+    # equation_of_motion espera uma função lagrangiana do tipo L(q, q_dot)
+    f = partial(equation_of_motion, f_lnn)
+    return odeint(f, initial_state, t)
+
+# malha de tempo
+tvec = dt * np.arange(N, dtype=np.float64)
+
+# (A) TREINO: rollout 0 → N 
+# Real (0..N-1) vindo do seu theta filtrado
+theta1_real_train = theta1_use[:N]
+theta2_real_train = theta2_use[:N]
+x1e_tr, y1e_tr, x2e_tr, y2e_tr = radial2cartesian(theta1_real_train, theta2_real_train, L1, L2)
+
+# LNN: integrar a partir do estado inicial real x_all[0], por N pontos
+x0_train = jnp.array(x_all[0], dtype=jnp.float64)
 f_lnn = learned_lagrangian(params)
-x_lnn = jax.device_get(solve_lagrangian(f_lnn, x0, t=tvec))
+x_lnn_train = jax.device_get(solve_lagrangian(f_lnn, x0_train, tvec))  # (N,4)
 
-theta1_lnn = x_lnn[:, 0]
-theta2_lnn = x_lnn[:, 1]
-x1m, y1m, x2m, y2m = radial2cartesian(theta1_lnn, theta2_lnn, L1, L2)
+theta1_lnn_train = np.asarray(x_lnn_train[:, 0])
+theta2_lnn_train = np.asarray(x_lnn_train[:, 1])
+x1m_tr, y1m_tr, x2m_tr, y2m_tr = radial2cartesian(theta1_lnn_train, theta2_lnn_train, L1, L2)
 
-# mesma moldura p/ ambos
+# (B) TESTE/FUTURO: rollout N → 2N
+# Real (N..2N-1)
+theta1_real_test = theta1_use[N:2*N]
+theta2_real_test = theta2_use[N:2*N]
+x1e_te, y1e_te, x2e_te, y2e_te = radial2cartesian(theta1_real_test, theta2_real_test, L1, L2)
+
+# LNN: integrar a partir do estado real em N, por N pontos (futuro)
+x0_test = jnp.array(x_all[N], dtype=jnp.float64)
+x_lnn_test = jax.device_get(solve_lagrangian(f_lnn, x0_test, tvec))  # (N,4)
+
+theta1_lnn_test = np.asarray(x_lnn_test[:, 0])
+theta2_lnn_test = np.asarray(x_lnn_test[:, 1])
+x1m_te, y1m_te, x2m_te, y2m_te = radial2cartesian(theta1_lnn_test, theta2_lnn_test, L1, L2)
+
+# Visualização
 R = (L1 + L2) * 1.05
 lims = (-R, R)
 
-# (opcional) reduzir pontos só na visualização
-viz_stride = 1  # aumente p/ 2,3,… se quiser desenhar menos pontos
+viz_stride = 1 
 
-# cores (verde e azul “normal”)
 green = '#2e7d32'
 blue  = '#1565c0'
 
-# === FIG 1: EXPERIMENTAL ===
-plt.figure(figsize=(6,6), dpi=140)
-plt.plot(x1e[::viz_stride], y1e[::viz_stride], '--', lw=1.6, alpha=0.95,
-         color=green, label='M1 exp')
-plt.plot(x2e[::viz_stride], y2e[::viz_stride], '--', lw=1.6, alpha=0.95,
-         color=blue,  label='M2 exp')
-plt.scatter(0, 0, s=50, c='red', edgecolors='k', zorder=3, label='pivô')
-plt.axis('equal'); plt.xlim(lims); plt.ylim(lims)
-plt.title("Trajetórias 2D — Dados experimentais (0–~75 s)")
-plt.xlabel("x [m]"); plt.ylabel("y [m]")
-plt.legend(loc='upper right', frameon=True)
-plt.tight_layout()
+def plot_panel(ax, x1, y1, x2, y2, title, label_m1, label_m2):
+    ax.plot(x1[::viz_stride], y1[::viz_stride], '--', lw=1.4, alpha=0.95, color=green, label=label_m1)
+    ax.plot(x2[::viz_stride], y2[::viz_stride], '--', lw=1.4, alpha=0.95, color=blue,  label=label_m2)
+    ax.scatter(0, 0, s=40, c='red', edgecolors='k', zorder=3, label='pivô')
+    ax.set_aspect('equal', 'box')
+    ax.set_xlim(lims); ax.set_ylim(lims)
+    ax.set_title(title)
+    ax.set_xlabel("x [m]"); ax.set_ylabel("y [m]")
+    ax.legend(loc='upper right', frameon=True)
 
-# === FIG 2: LNN ===
-plt.figure(figsize=(6,6), dpi=140)
-plt.plot(x1m[::viz_stride], y1m[::viz_stride], '--', lw=1.6, alpha=0.95,
-         color=green, label='M1 LNN')
-plt.plot(x2m[::viz_stride], y2m[::viz_stride], '--', lw=1.6, alpha=0.95,
-         color=blue,  label='M2 LNN')
-plt.scatter(0, 0, s=50, c='red', edgecolors='k', zorder=3, label='pivô')
-plt.axis('equal'); plt.xlim(lims); plt.ylim(lims)
-plt.title("Trajetórias 2D — LNN (0–~75 s)")
-plt.xlabel("x [m]"); plt.ylabel("y [m]")
-plt.legend(loc='upper right', frameon=True)
-plt.tight_layout()
+# Figura 1: Treino (0 → N) 
+fig1, ax1 = plt.subplots(1, 2, figsize=(12, 5), dpi=140)
+plot_panel(ax1[0], x1e_tr, y1e_tr, x2e_tr, y2e_tr,
+           title=f"Trajetória Real — Treino (0 → N={N} pontos)",
+           label_m1="M1 real", label_m2="M2 real")
+plot_panel(ax1[1], x1m_tr, y1m_tr, x2m_tr, y2m_tr,
+           title=f"Trajetória LNN — Treino (0 → N={N} pontos)",
+           label_m1="M1 LNN", label_m2="M2 LNN")
+fig1.tight_layout()
+
+# Figura 2: Teste/Futuro (N → 2N) 
+fig2, ax2 = plt.subplots(1, 2, figsize=(12, 5), dpi=140)
+plot_panel(ax2[0], x1e_te, y1e_te, x2e_te, y2e_te,
+           title=f"Trajetória Real — Teste (N={N} → 2N={2*N} pontos)",
+           label_m1="M1 real", label_m2="M2 real")
+plot_panel(ax2[1], x1m_te, y1m_te, x2m_te, y2m_te,
+           title=f"Trajetória LNN — Teste (N={N} → 2N={2*N} pontos)",
+           label_m1="M1 LNN", label_m2="M2 LNN")
+fig2.tight_layout()
+
+plt.show()
